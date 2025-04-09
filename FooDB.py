@@ -10,22 +10,22 @@ import logging
 os.makedirs('logs', exist_ok=True)
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(filename='logs/foodb2.log', level=logging.INFO)
+logging.basicConfig(filename='logs/foodb.log', level=logging.INFO)
 
-error_handler = logging.FileHandler("logs/error2.log")
+error_handler = logging.FileHandler("logs/error.log")
 error_handler.setLevel(logging.ERROR)
 
 logger.addHandler(error_handler)
 
 food_memo = {}
-class_memo = {}
+class_memo = {None: None}
 
 
 CATALOG_PAGE = "https://foodb.ca/compounds?filter=true&quantified=1&page="
 MET_PAGE = "https://foodb.ca/compounds/"
 
 TOTAL_PAGES = 151
-START_PAGE = 57
+START_PAGE = 1
 
 def parseWebpage(conn):
     for page_num in range(START_PAGE, TOTAL_PAGES+1):
@@ -108,7 +108,7 @@ def parseWebpage(conn):
                     cursor.execute(associated_food_insert_query, associated_food_data)
                 conn.commit()
             except (OperationalError, DatabaseError) as e:
-                logger.error(f"{e}")
+                logger.error(f" {id}: {e}")
                 conn.rollback()
         cursor.close()
                 
@@ -122,6 +122,78 @@ def parseWebpage(conn):
         # Associated Foods: {food_map}
         #         """)
         
+def parseId(conn, id, insertCompound=True):
+    logger.info(f" Working with id: {id}")
+    page = requests.get(MET_PAGE + id)
+    soup = bs(page.text, features="xml")
+    try:
+        fooDB_name = getName(soup)
+        met_class = getClass(soup)
+        food_map = getAssociatedFoods(soup)
+    except Exception as e:
+        logger.error(f" {id}: {e}")
+        return
+    cursor = conn.cursor()
+    try:
+        foodb_insert_query = """
+            INSERT INTO foodb_compound (id, name, class_id)
+            VALUES (%s, %s, %s)
+        """
+        compound_class_insert_query = """
+            INSERT INTO compound_class (name)
+            VALUES (%s)
+            RETURNING id
+        """
+        compound_class_select_query = """
+            SELECT id FROM compound_class
+            WHERE name = %s
+        """
+        if insertCompound:
+            if met_class not in class_memo:
+                cursor.execute(compound_class_select_query, (met_class,))
+                class_id = cursor.fetchone()
+                if class_id:
+                    class_memo[met_class] = class_id
+                else:
+                    cursor.execute(compound_class_insert_query, (met_class,))
+                    class_memo[met_class] = cursor.fetchone()[0]
+                    conn.commit()
+            foodb_data = (id, fooDB_name, class_memo[met_class])
+            cursor.execute(foodb_insert_query, foodb_data)
+            conn.commit()
+
+        associated_food_insert_query = """
+            INSERT INTO associated_food (compound_id, food_id, average_value, max_value, min_value)
+            VALUES (%s, %s, %s, %s, %s)
+        """
+        food_item_insert_query = """
+            INSERT INTO food_item (name)
+            VALUES (%s)
+            RETURNING id
+        """
+        food_item_select_query = """
+            SELECT id FROM food_item
+            WHERE name = %s
+        """
+        for key, value in food_map.items():
+            if key not in food_memo:
+                
+                cursor.execute(food_item_select_query, (key,))
+                food_id = cursor.fetchone()
+                if food_id:
+                    food_memo[key] = food_id
+                else:
+                    cursor.execute(food_item_insert_query, (key,))
+                    food_memo[key] = cursor.fetchone()[0]
+                    conn.commit()
+                
+            associated_food_data = (id, food_memo[key], value["average_value"], value["max_value"], value["min_value"])
+            cursor.execute(associated_food_insert_query, associated_food_data)
+        conn.commit()
+    except (OperationalError, DatabaseError) as e:
+        logger.error(f" {id}: {e}")
+        conn.rollback()
+    cursor.close()
     
 def getName(soup):
     name = soup.find("name")
@@ -178,14 +250,7 @@ def getAssociatedFoods(soup):
     return foods
 
         
-
-if __name__ == "__main__":
-    load_dotenv()
-    conn = psycopg2.connect(database = os.getenv('PSQL_DATABASE'), 
-                        user = os.getenv('PSQL_USERNAME'), 
-                        host= os.getenv('PSQL_HOST'),
-                        password = os.getenv('PSQL_PASSWORD'),
-                        port = 5432)
+def createDatabases(conn):
     cursor = conn.cursor()
     check_and_create(cursor, "compound_class", 
                         """
@@ -206,7 +271,7 @@ if __name__ == "__main__":
                         CREATE TABLE foodb_compound (
                         id CHAR(9) PRIMARY KEY,
                         name VARCHAR(100) NOT NULL,
-                        class_id INT NOT NULL,
+                        class_id INT,
                         CONSTRAINT fk_class_id FOREIGN KEY (class_id)
                             REFERENCES compound_class (id)
                             ON DELETE CASCADE
@@ -231,6 +296,17 @@ if __name__ == "__main__":
                         """)
     conn.commit()
     cursor.close()
+    
+
+if __name__ == "__main__":
+    load_dotenv()
+    conn = psycopg2.connect(database = os.getenv('PSQL_DATABASE'), 
+                        user = os.getenv('PSQL_USERNAME'), 
+                        host= os.getenv('PSQL_HOST'),
+                        password = os.getenv('PSQL_PASSWORD'),
+                        port = 5432)
+    createDatabases(conn)
+    
     try:
         parseWebpage(conn)
     finally:
