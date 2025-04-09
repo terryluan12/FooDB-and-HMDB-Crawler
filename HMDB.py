@@ -4,11 +4,11 @@ import re
 
 CATALOG_PAGE = "https://hmdb.ca/metabolites?blood=1&c=hmdb_id&d=up&filter=true&food=1&quantified=1&page="
 MET_PAGE = "https://hmdb.ca/metabolites/"
-
+MET_FOODB_PAGE = "https://foodb.ca/compounds/"
 TOTAL_PAGES = 1
 
 def parseWebpage():
-    for page_num in range(0, TOTAL_PAGES):
+    for page_num in range(1, TOTAL_PAGES+1):
         page = requests.get(CATALOG_PAGE + str(page_num))
         soup = bs(page.text, "html.parser")
         met_link = soup.find_all("td", class_="metabolite-link")
@@ -17,16 +17,16 @@ def parseWebpage():
         print(f"----------------------------------------------------------")
 
     for id in ids:
-        print(f"DEBUG: Working with id {id}")
-        page = requests.get(MET_PAGE + id)
-        soup = bs(page.text, "html.parser")
+        print(f"DEBUG: Working with id: {id}")
+        page = requests.get(MET_PAGE + id + ".xml")
+        soup = bs(page.text, features="xml")
 
         common_name = getName(soup)
         loci = getLoci(soup)
         food_map = getFoodSources(soup)
-        concentrations = getConcentrations(soup, "Normal Concentrations")
-        abconcentrations = getConcentrations(soup, "Abnormal Concentrations")
-            
+        concentrations = getConcentrations(soup, True)
+        abconcentrations = getConcentrations(soup, False)
+        
         print(f"""
     Information for {id}:\n
     Common Name: {common_name}\n
@@ -38,33 +38,38 @@ def parseWebpage():
         
     
 def getName(soup):
-    common_name_tag = soup.find(string="Common Name").parent
-    return common_name_tag.parent.td.text
+    name = soup.find("name")
+    if not name:
+        print("\tAlert: No Name")
+    return name.text
 
 def getLoci(soup):
-    loci_tag = soup.find(string="Biospecimen Locations").parent
-    return [locus.text for locus in loci_tag.parent.find_all("li")]
+    location_tags = soup.find("biospecimen_locations")
+    if not location_tags:
+        print("\tAlert: No Biospecimen locations")
+    locations = [loc.text for loc in location_tags.find_all("biospecimen")]
+    return locations
 
 def getFoodSources(soup):
-    disposition_tag = soup.find(string="Disposition").parent
-    food_tag = disposition_tag.parent.next_sibling.find_all(string="Food")[1].parent
-    if food_tag:
-        food_table = food_tag.parent.parent.find("ul", class_="category-ontnode")
-        food_category_tags = food_table.find_all("a", class_="category-ontnode")
-        food_map = {}
-        for cat in food_category_tags:
-            cat_name = cat.string
-            food_map[cat_name] = []
-            
-            for tag in cat.next_sibling.find_all(True):
-                if(tag.get("class") and tag.get("class")[0] == "leaf-ontnode"):
-                    food_map[cat_name].append(tag.string)
-    else:
-        print("No Food source")
+    foodb_id = soup.find("foodb_id")
+    if not foodb_id or foodb_id.string:
+        print("\tAlert: No Food ID")
+        return
+    page = requests.get(MET_FOODB_PAGE + foodb_id.string)
+    
+    foodb_soup = bs(page.text, "xml")
+    food_tags = foodb_soup.find("foods")
+    foods = []
+    if not food_tags:
+        print("\tError: No food data")
+        
+    for food in food_tags.find_all("food"):
+        foods.append(food.find("name").string)
+    return foods
 
-def getConcentrations(soup, name="Normal Concentrations"):
+def getConcentrations(soup, normal = True):
     # Details header ignored
-    headers = ["Biospecimen", "Status", "Value", "Age", "Sex", "Condition", "Reference"]
+    headers = ["biospecimen", "Status", "Value", "Age", "Sex", "Condition", "Reference"]
 
     def meetsCriteria(tag):
         """Currently looks for only in blood and that it can be quantified
@@ -73,32 +78,33 @@ def getConcentrations(soup, name="Normal Concentrations"):
             tag (bs4.element.tag): the tag being filtered
         """
         return tag.name == "td" and tag.text == "Detected and Quantified"
+    conc_table = soup.find("normal_concentrations") if normal else soup.find("abnormal_concentrations")
     
-    normal_conc_tag = soup.find(string=name).parent
-    conc_table = normal_conc_tag.parent.next_sibling.find("table")
-    conc_rows = conc_table.find_all(meetsCriteria)
-    
-    concentrations = []
-    for tag in conc_rows:
-        columns = tag.parent.find_all(True)
-        concentration_info = {}
-        for header, col in zip(headers, columns):
-            href_tag = col.find("a", {"href": True})
-            title_tag = col.find("span", {"title": True})
-            if href_tag:
-                concentration_info[header] = href_tag.get("href")
-            elif title_tag:
-                concentration_info[header] = title_tag.get("title")
-            else:
-                concentration_info[header] = col.text
-        concentrations.append(concentration_info)
+    if not conc_table:
+        print(f"\tAlert: {'Normal Concentrations' if normal else 'Abnormal Concentrations'} missing")
+    concs = conc_table.find_all("concentration")
+    if not concs:
+        print(f"\tError: Concentrations missing")
         
+    concentrations = []
+    
+    for conc in concs:
+        concentration = {}
+        for col in conc.find_all(True):
+            if col.name == "references":
+                concentration["references"] = []
+                references = col.find_all("reference")
+                if len(references) != 1:
+                    print(f"\tAlert: More than one reference")
+                for reference in references:
+                    ref = {}
+                    for ref_col in reference.find_all(True):
+                        ref[ref_col.name] = ref_col.text
+                    concentration["references"].append(ref)
+            else:
+                concentration[col.name] = col.text
+        concentrations.append(concentration)
     return concentrations
 
 if __name__ == "__main__":
-    # parseWebpage
-    page = requests.get("https://hmdb.ca/metabolites/HMDB0000010.xml")
-    soup = bs(page.text, "html.parser")
-    with open("test.html", "w") as file:
-        file.write(soup.prettify()) 
-    
+    parseWebpage()
