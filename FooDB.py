@@ -40,7 +40,6 @@ def parseWebpage(conn):
     
         cursor = conn.cursor()
         for id in ids:
-            id = "FDB013255"
             logger.info(f" Working with id: {id}")
             page = requests.get(MET_PAGE + id)
             soup = bs(page.text, features="xml")
