@@ -1,83 +1,38 @@
 from bs4 import BeautifulSoup as bs
 import requests
-import re
+from FooDB import parseFooDBId
+from logger import logger
+from psycopg2.extensions import connection, cursor
+from psycopg2 import OperationalError, DatabaseError
+from sql import insertCompoundDatabase, insertBioSpecDatabase, insertConcentrationDatabase, getCompoundIdFromFooDBId, updateHmdbId, getCompoundIdAndFooDBIdFromName
 
-CATALOG_PAGE = "https://hmdb.ca/metabolites?blood=1&c=hmdb_id&d=up&filter=true&food=1&quantified=1&page="
-MET_PAGE = "https://hmdb.ca/metabolites/"
-MET_FOODB_PAGE = "https://foodb.ca/compounds/"
-TOTAL_PAGES = 1
+from typing import List
+import settings
 
-def parseWebpage():
-    for page_num in range(1, TOTAL_PAGES+1):
-        page = requests.get(CATALOG_PAGE + str(page_num))
-        soup = bs(page.text, "html.parser")
-        met_link = soup.find_all("td", class_="metabolite-link")
-        ids = [link.a.text for link in met_link]
-        print(f"DEBUG: Got ID's for page {page_num}")
-        print(f"----------------------------------------------------------")
-
-        for id in ids:
-            print(f"DEBUG: Working with id: {id}")
-            page = requests.get(MET_PAGE + id + ".xml")
-            soup = bs(page.text, features="xml")
-
-            common_name = getName(soup)
-            loci = getLoci(soup)
-            food_map = getFoodSources(soup)
-            concentrations = getConcentrations(soup, True)
-            abconcentrations = getConcentrations(soup, False)
-            
-            print(f"""
-        Information for {id}:\n
-        Common Name: {common_name}\n
-        Biospecimen Location: {loci}\n
-        Food Source: {food_map}\n
-        Concentrations: {concentrations}\n
-        AbConentrations: {abconcentrations}\n
-                """)
-    
-def getName(soup):
+def getName(soup: bs) -> str:
     name = soup.find("name")
     if not name or not name.string:
-        print("\tAlert: No Name")
+        logger.warning(" No name")
         return
     return name.string
 
-def getLoci(soup):
+def getBiospecimens(soup: bs):
     location_tags = soup.find("biospecimen_locations")
     if not location_tags:
-        print("\tAlert: No Biospecimen locations")
+        logger.warning(" No biospecimen locations")
         return
     locations = [loc.text for loc in location_tags.find_all("biospecimen")]
     return locations
 
-def getFoodSources(soup):
-    foodb_id = soup.find("foodb_id")
-    if not foodb_id or not foodb_id.string:
-        print("\tAlert: No Food ID")
-        return
-    page = requests.get(MET_FOODB_PAGE + foodb_id.string)
-    
-    foodb_soup = bs(page.text, "xml")
-    food_tags = foodb_soup.find("foods")
-    foods = []
-    if not food_tags:
-        print("\tAlert: No food data")
-        return
-        
-    for food in food_tags.find_all("food"):
-        foods.append(food.find("name").string)
-    return foods
-
-def getConcentrations(soup, normal = True):
+def getConcentrations(soup: bs, normal = True):
     conc_table = soup.find("normal_concentrations") if normal else soup.find("abnormal_concentrations")
     
     if not conc_table:
-        print(f"\tAlert: {'Normal Concentrations' if normal else 'Abnormal Concentrations'} missing")
+        logger.warning(f" {'Normal Concentrations' if normal else 'Abnormal Concentrations'} missing")
         return
-    concs = conc_table.find_all("concentration")
+    concs = conc_table.find_all("concentration", recursive=False)
     if not concs:
-        print(f"\tError: Concentrations missing")
+        logger.warning(f" {'Abnormal' if not normal else ''} Concentrations missing")
         return
         
     concentrations = []
@@ -88,39 +43,122 @@ def getConcentrations(soup, normal = True):
         "patient_sex": "sex",
         "subject_condition": "condition",
         "patient_information": "condition",
+        "concentration_value": "value",
+        "concentration_units": "units"
     }
     
     for conc in concs:
         concentration = {}
         isQuantified = True
-        print(f"Conc.findAll is {conc.find_all(True)}")
-        for tag in conc.find_all(True):
+        unquantified_values = []
+        
+        for tag in conc.find_all(True, recursive=False):
             name = tag.name
             if name == "references":
                 concentration["references"] = []
-                references = tag.find_all("reference")
-                if len(references) == 0:
-                    print(f"\tAlert: Zero references")
-                elif len(references) != 1:
-                    print(f"\tAlert: More than one reference")
+                references = tag.find_all("reference", recursive=False)
                 for reference in references:
                     ref = {}
-                    for ref_col in reference.find_all(True):
+                    for ref_col in reference.find_all(True, recursive=False):
                         ref[ref_col.name] = ref_col.text
                     concentration["references"].append(ref)
             else:
-                if name == "reference":
-                    continue
-                if tag.text == "Not Specified" or tag.text == "Not Quantified" or not tag.string:
-                    print(f"It is {tag}")
-                    isQuantified = False
-                    break
+                tag_value = None
                 if name in col_map:
                     name = col_map[name]
-                concentration[name] = tag.string
+                
+                if tag.text == "Not Specified" or tag.text == "Not Quantified" or not tag.string:
+                    if name == "value":
+                        isQuantified = False
+                        break
+                    else:
+                        if name != "age" and name != "sex":
+                            unquantified_values.append(name)
+                        tag_value = None
+                else:
+                    tag_value = tag.string
+                
+                concentration[name] = tag_value
         if isQuantified:
             concentrations.append(concentration)
+            if unquantified_values:
+                logger.warning(f" {','.join(unquantified_values)} is not specified/quantified")
+                    
     return concentrations
+        
+def parseHMDBId(conn: connection, cur: cursor, id: str):
+    logger.info(f" Parsing HMDB with id: {id}")
+    compound_id = None
+    page = requests.get(settings.HMDB_MET_PAGE + id + ".xml")
+    soup = bs(page.text, features="xml")
 
-if __name__ == "__main__":
-    parseWebpage()
+    name = getName(soup)
+    biospecimens = getBiospecimens(soup)
+    concentrations = getConcentrations(soup, True)
+    abconcentrations = getConcentrations(soup, False)
+    
+    result = getCompoundIdAndFooDBIdFromName(conn, cur, name)
+    if result:
+        compound_id, db_foodb_id = result
+    foodb_id_tag = soup.find("foodb_id")
+
+    if foodb_id_tag and foodb_id_tag.string:
+        parsed_foodb_id = foodb_id_tag.string
+        if not compound_id:
+            logger.info(f" Couldn't find from name {name}. Using parsed foodb_id {parsed_foodb_id}")
+            compound_id = getCompoundIdFromFooDBId(conn, cur, parsed_foodb_id)
+            if not compound_id:
+                compound_id = parseFooDBId(conn, cur, parsed_foodb_id)
+        elif db_foodb_id != parsed_foodb_id:
+            logger.error(f" {id}: Issue aligning metabolite {name} with id { db_foodb_id } in database and parsed foodb_id {parsed_foodb_id}")
+            return
+    
+    if not compound_id:
+        logger.warning(f" {id}: No fooDB ID. Creating compound without fooDB ID")
+        compound_id = insertCompoundDatabase(conn, cur, id, name, None, True, False)
+    else:
+        updateHmdbId(conn, cur, compound_id, id)
+
+    if not biospecimens:
+        logger.warning(" No Biospecimens")
+        
+    try:
+        for biospec in biospecimens:
+            insertBioSpecDatabase(conn, cur, compound_id, biospec)
+        
+    except (OperationalError, DatabaseError) as e:
+        logger.error(f" {id}: Error inserting biospecimen: {e}")
+        conn.rollback()
+    
+    if not concentrations:
+        logger.info(" Concentrations missing")
+    else:
+        for concentration in concentrations:
+            insertConcentrationDatabase(conn, cur, compound_id, concentration)
+    
+    if not abconcentrations:
+        logger.info(" Abnormal Concentrations missing")
+    else:
+        for abconcentration in abconcentrations:
+            insertConcentrationDatabase(conn, cur, compound_id, abconcentration)
+    
+
+def crawlHMDB(conn: connection) -> None:
+    for page_num in range(settings.HMDB_START_PAGE, settings.HMDB_TOTAL_PAGES+1):
+        page = requests.get(settings.HMDB_CATALOG_PAGE + str(page_num))
+        soup = bs(page.text, "html.parser")
+        met_link = soup.find_all("td", class_="metabolite-link")
+        ids = [link.a.text for link in met_link]
+        
+        logger.info(f" Got ID's for page {page_num}")
+        logger.info(f" ----------------------------------------------------------")
+
+        cur = conn.cursor()
+        
+        try:
+            for id in ids:
+                parseHMDBId(conn, cur, id)
+                        
+        finally: 
+            cur.close()
+    
