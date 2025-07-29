@@ -1,10 +1,17 @@
 import os
 import logging
-import requests
 from bs4 import BeautifulSoup as bs
+import aiohttp
+import settings
 
-from logging import Logger
-from typing import Dict
+from psycopg import AsyncConnection, AsyncCursor
+
+
+from sql import populateFoodDatabase, populateBiospecimenMemo, populateClassMemo, populateFoodCatMemo
+
+import json
+from psycopg import AsyncConnection
+from typing import Dict, List
 
 DATABASES = {
     "food_category":
@@ -117,15 +124,57 @@ DATABASES = {
         """,
 }
 
-def check_and_create(cur, name, creation_command) -> None:
-    cur.execute("SELECT EXISTS(SELECT * from information_schema.tables WHERE table_name=%s)", (name,))
-    if not cur.fetchone()[0]:
-        cur.execute(creation_command)
+async def check_and_create(cur: AsyncCursor, name, creation_command) -> None:
+    await cur.execute("SELECT EXISTS(SELECT * from information_schema.tables WHERE table_name=%s)", (name,))
+    row = await cur.fetchone()
+    if not row:
+        raise ValueError("No row returned")
+    if not row[0]:
+        await cur.execute(creation_command)
         
 
-def createDatabases(conn) -> None:
+async def createDatabases(conn: AsyncConnection) -> None:
     cursor = conn.cursor()
     for database_name, create_command in DATABASES.items():
-        check_and_create(cursor, database_name, create_command)
-    conn.commit()
-    cursor.close()
+        await check_and_create(cursor, database_name, create_command)
+    await conn.commit()
+    await cursor.close()
+
+
+
+async def get_page_text(url: str):
+    timeout = aiohttp.ClientTimeout(total=240)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(url) as resp:
+            page_text = await resp.text()
+            return page_text
+        
+
+async def getFoodMap() -> Dict[str, List[str]]:
+    food_map: Dict[str, List[str]] = {}
+    for page_num in range(1, settings.FOODB_FOOD_TOTAL_PAGES+1):
+        url = settings.FOODDB_FOOD_CATALOG_URL + str(page_num)
+        page_text = await get_page_text(url)
+        soup = bs(page_text, "html.parser")
+        food_links = soup.find_all("a", class_="btn-show")
+        for food_link in food_links:
+            row = food_link.parent.parent
+            row_elements = row.find_all(True, recursive=False)
+            category = row_elements[4].string
+            if category not in food_map:
+                food_map[category] = []
+            food_map[category].append(row_elements[1].string)
+    return food_map
+
+
+async def populate_databases(conn: AsyncConnection, repopulate_foodmap: bool):
+    await createDatabases(conn)
+    if repopulate_foodmap:
+        os.makedirs("cache", exist_ok=True)
+        with open("cache/food_map", "w") as file:
+            food_map = await getFoodMap()
+            json.dump(food_map, file, indent=2)
+        await populateFoodDatabase(conn, food_map)
+    await populateBiospecimenMemo(conn)
+    await populateClassMemo(conn)
+    await populateFoodCatMemo(conn)

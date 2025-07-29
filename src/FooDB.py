@@ -1,10 +1,10 @@
 from bs4 import BeautifulSoup as bs
-import requests
-from psycopg2 import OperationalError, DatabaseError
+from psycopg import AsyncConnection, OperationalError, DatabaseError
 from typing import Dict, List
-from psycopg2.extensions import connection, cursor
 from sql import insertCompoundDatabase, connectFoodDatabase
 import settings
+from utility import get_page_text
+import asyncio
 
 from logger import logger
 
@@ -62,53 +62,41 @@ def getFoods(soup):
         
     return foods
 
-def getFoodMap() -> Dict[str, List[str]]:
-    food_map: Dict[str, List[str]] = {}
-    for page_num in range(1, settings.FOODB_FOOD_TOTAL_PAGES+1):
-        page = requests.get(settings.FOODDB_FOOD_CATALOG_URL + str(page_num))
-        soup = bs(page.text, "html.parser")
-        food_links = soup.find_all("a", class_="btn-show")
-        for food_link in food_links:
-            row = food_link.parent.parent
-            row_elements = row.find_all(True, recursive=False)
-            category = row_elements[4].string
-            if category not in food_map:
-                food_map[category] = []
-            food_map[category].append(row_elements[1].string)
-    return food_map
-
         
-def parseFooDBId(conn: connection, cur: cursor, id: str) -> int:
-    logger.info(f" Parsing FooDB with id: {id}")
-    page = requests.get(settings.FOODB_MET_PAGE + id)
-    soup = bs(page.text, features="xml")
-    try:
-        name = getName(soup)
-        met_class = getClass(soup)
-        foods = getFoods(soup)
-        
-    #     logger.debug(f"""
-    # Information for {id}:
-    # fooDB Name: {name}
-    # Class: {met_class}
-    # Associated Foods: {foods}
-    #         """)
-    except Exception as e:
-        logger.error(f" {id}: {e}")
-        return
-    try:
-        compound_id = insertCompoundDatabase(conn, cur, id, name, met_class, False, True)
-        for food, value in foods.items():
-            connectFoodDatabase(conn, cur, compound_id, food, value["average_value"], value["max_value"], value["min_value"])
-        return compound_id
-    except (OperationalError, DatabaseError) as e:
-        logger.error(f" {id}: {e}")
-        conn.rollback()
+async def parseFooDBId(conn: AsyncConnection, id: str):
+    async with conn.cursor() as cur:
+        logger.info(f" Parsing FooDB with id: {id}")
+        url = settings.FOODB_MET_PAGE + id
+        page_text = await get_page_text(url)
+        soup = bs(page_text, features="xml")
+        try:
+            name = getName(soup)
+            met_class = getClass(soup)
+            foods = getFoods(soup)
+            
+        #     logger.debug(f"""
+        # Information for {id}:
+        # fooDB Name: {name}
+        # Class: {met_class}
+        # Associated Foods: {foods}
+        #         """)
+        except Exception as e:
+            logger.error(f" {id}: {e}")
+            return
+        try:
+            compound_id = await insertCompoundDatabase(conn, cur, id, name, met_class, False, True)
+            for food, value in foods.items():
+                await connectFoodDatabase(conn, cur, compound_id, food, value["average_value"], value["max_value"], value["min_value"])
+            return compound_id
+        except (OperationalError, DatabaseError) as e:
+            logger.error(f" {id}: {e}")
+            await conn.rollback()
 
-def crawlFooDB(conn: connection):
+async def crawlFooDB(conn: AsyncConnection):
     for page_num in range(settings.FOODB_START_PAGE, settings.FOODB_TOTAL_PAGES+1):
-        page = requests.get(settings.FOODB_CATALOG_PAGE + str(page_num))
-        soup = bs(page.text, "html.parser")
+        url = settings.FOODB_CATALOG_PAGE + str(page_num)
+        page_text = await get_page_text(url)
+        soup = bs(page_text, "html.parser")
         
         rows = soup.find_all("a", class_="btn-show")
         ids = [link.text for link in rows]
@@ -117,8 +105,4 @@ def crawlFooDB(conn: connection):
         logger.info(f" ----------------------------------------------------------")
     
         cur = conn.cursor()
-        try:
-            for id in ids:
-                parseFooDBId(conn, cur, id)
-        finally:
-            cur.close()
+        await asyncio.gather(*[parseFooDBId(conn, id) for id in ids])
